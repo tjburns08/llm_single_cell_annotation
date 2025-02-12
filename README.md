@@ -6,7 +6,9 @@ There has been some work by others to this end, but the purpose of this project 
 
 ## Instructions
 
-Simply go into rmd, and pull out annotate_pbmc_3k.Rmd. This has all the code you need. It should run on its own, from anywhere. 
+Simply go into rmd, and pull out annotate_pbmc_3k_public.Rmd. This has all the code you need. It should run on its own, from anywhere. 
+
+As a preliminary step, you need to sign up to OpenRouter, and get an API key. You only need to add around $5 to "credits." You'll be operating on fractions of a penny for a given request. Then, you go to the line in the R Markdown that says user_api_key <- "your_api_key_here" and replace that with your API key, as a string. 
 
 I will note that even if you control for random seeds, the LLM is going to name things differently each time, so when you run it, the cluster names from the LLM might not line up perfectly. For example, in the run the I display, the LLM did not distinguish between two types of monocytes, and two clusters were annotated as such. Running it again, and/or running it with a different model, you might get different results.
 
