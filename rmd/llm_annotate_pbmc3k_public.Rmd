@@ -1,0 +1,330 @@
+---
+title: "LLM based annotation of the PBMC 3k dataset"
+author: Tyler J Burns, PhD
+date: "2025-02-06 - 2025-02-12"
+output:
+  html_document:
+    toc: true         
+    toc_float: true     
+    number_sections: false 
+    toc_depth: 3 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+[Home](https://tjburns08.github.io/)
+
+---
+
+*You can know the name of a bird in all the languages of the world, but when you're finished, you'll know absolutely nothing whatever about the bird... So let's look at the bird and see what it's doing — that's what counts. I learned very early the difference between knowing the name of something and knowing something.*\
+\
+Richard Feynmann, "What Do You Care What Other People Think?": Further Adventures of a Curious Character
+
+---
+
+## Introduction
+
+A typical single-cell analysis workflow (this includes flow cytometry and imaging) involves the act of clustering the cells and then annotating them. The annotation typically involves figuring what markers are specific to a given cluster and not other clusters, and then using prior biological knowledge to annotate the cells. 
+
+The advent of increasingly sophisticated LLMs has opened up the possibility of using them to help in the annotation process. The idea would be that you take the genes and proteins that mark a particular cluster, and feed it into a LLM and ask it to make a guess as to what cell population the cluster is. You could pre-prompt it as much as you want with the biological context (eg. this is a PBMC dataset for single-cell sequencing, with these conditions, and so forth). The biologist would then have a LLM "best guess" as to what cell subset the given cluster is.
+
+The use of APIs to these models, or the prospect of running them locally as smaller models become more capable, brings forth the possibility of integrating the LLM calls directly into data analysis pipelines. Here is where we are going to focus.
+
+In this markdown, we will annotate the PBMC 3k dataset with the help of a LLM that we run directly in R, such that the LLM's output can be stored as an output, and therefore the annotation can take place in a completely automated fashion. After annotating the data, we will run the annotation tool another few times to check the stability of the annotations. 
+
+We find that the LLM annotates the PBMCs in comparison to ground truth, but we note that PBMC data is relatively simple, and it would be ideal if this type of workflow was battle tested across more difficult datasets. The main purpose of this markdown, at the time of writing, is to enable users worldwide to both utilize what is here, and battle test it on their more complex "real world" data.
+
+## The standard Seurat workflow
+
+Let's get started by uploading the PBMC 3k dataset, and running it through Seurat's guided clustering tutorial, which can be found [here](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html). If you want to see how you can do the analysis without Seurat, or understand what Seurat is doing under the hood, please go to my markdown [here](https://tjburns08.github.io/scrna_seq_piepline_pbmc_3k.html).
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(SeuratData)
+set.seed(42)
+```
+
+```{r}
+pbmc <- SeuratData::LoadData("pbmc3k")
+```
+
+And now we will run it through the standard pipeline.
+
+```{r}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+pbmc <- ScaleData(pbmc, features = rownames(pbmc))
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+```
+
+We will then run UMAP to set up some visualizations:
+
+```{r}
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+```
+
+What we could do is feed the 2000 dimensional feature vectors into a LLM for annotation as an experiment, but for the sake of minimizing token use (and thus minimizing cost) we are going to utilize Seurat's marker finder, which finds which markers in a given cluster are significantly enrich in comparison to everything outside that cluster.
+
+```{r}
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE)
+pbmc.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+```
+
+And from here, to set up my sanity checks, we are going to view the Seurat built in heatmap.
+
+```{r}
+pbmc.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 20) %>%
+    ungroup() -> top10
+
+DoHeatmap(pbmc, features = top10$gene) + NoLegend()
+```
+
+## LLM assisted annotation
+
+And now we are ready for the LLM assisted annotation. 
+
+What are are going to do here is related to my command line chatbot project that I wrote about here [here](https://tjburns08.github.io/command_line_writeup.html). We could in theory take this command line chatbot and use R's system() command to run it. I did indeed do this in an earlier draft of this markdown. However, a much more user-friendly way of doing it is to just have the command for calling the LLM API directly in the workflow itself. I'll show you how to do this later.
+
+First let's pull out our top 10 genes for each cluster, which was set up earlier from the pbmc.markers object.
+
+```{r}
+top10
+```
+
+As you can see, this gives us which to 10 genes were statistically significant in terms of marking a cluster in comparison to not that cluster. What we did below for the proof of concept is we took the gene and the average log2 fold change and used that for the annotation. But you can use whichever columns you want.
+
+Ok, now we can feed this into our GPT model, which we are going to show below. We set up a wrapper so we ran run it multiple times, but you don't have to do it like that. Note the system call from above, which takes in a prompt as input. Note also that part of this involves subsetting the "top 10" tibble above by cluster, and selecting the columns of interest, and then converting the whole thing into a string that can be fed into the LLM as a prompt. 
+
+The prompt below works for the purpose of the proof of concept. But additional prompt engineering might help, especially for datasets that go beyond healthy PBMCs. 
+
+Below is the function that allows you to access the LLMs from OpenRouter. It takes as input the model choice and the prompt and returns the answer as output. Note that you need to sign up for an OpenRouter API key first. You can do that by going [here](https://openrouter.ai/).
+
+
+```{r, eval=FALSE}
+user_api_key <- "your_api_key_here"
+```
+
+```{r}
+# Load necessary libraries
+library(httr)
+library(jsonlite)
+
+# Define the function ask_llm that takes a prompt and a model choice as input.
+Chatbot <- function(model_choice = "gpt3", user_question, api_key = user_api_key) {
+  # Map the model choice to the corresponding model identifier
+  if (model_choice == "gpt3") {
+    model <- "openai/gpt-3.5-turbo"
+  } else if (model_choice == "gpt4") {
+    model <- "openai/gpt-4o-2024-11-20"
+  } else if (model_choice == "deepseek") {
+    model <- "deepseek/deepseek-r1"
+  } else if (model_choice == "claude") {
+    model <- "anthropic/claude-3.5-sonnet-20240620"
+  } else {
+    stop("Invalid model choice. Please choose 'gpt3', 'gpt4', 'deepseek', or 'claude'.")
+  }
+  
+  # Define the API endpoint and your API key (replace with your actual API key)
+  url <- "https://openrouter.ai/api/v1/chat/completions"
+  
+  # Create the JSON payload for the POST request
+  payload <- list(
+    model = model,
+    messages = list(
+      list(
+        role = "user",
+        content = user_question
+      )
+    )
+  )
+  
+  # Convert the payload to JSON
+  payload_json <- toJSON(payload, auto_unbox = TRUE)
+  
+  # Send the POST request to the API
+  response <- POST(
+    url,
+    add_headers(
+      Authorization = paste("Bearer", api_key),
+      "Content-Type" = "application/json"
+    ),
+    body = payload_json
+  )
+  
+  # Check for errors in the API response
+  if (status_code(response) != 200) {
+    stop("Error: Received status code ", status_code(response), "\n", content(response, "text"))
+  }
+  
+  # Parse the JSON response
+  result <- content(response, "parsed")
+  
+  # Return the chatbot's reply
+  return(result$choices[[1]]$message$content)
+}
+
+# Example usage of the function:
+answer <- Chatbot("claude", "What is better, Seurat or Scanpy?")
+cat("Answer:", answer)
+```
+
+You'll note that the LLM used below is Claude 3.5 Sonnet, which give you very good bang for your buck at the time of writing. However, later models may be better, either in terms of overall ability to give accurrate answers, or because they are more tailored to the life sciences. The chatbot allows for flexibility in this regard.
+
+```{r}
+AnnotationWrapper <- function() {
+  llm_annotations <- lapply(unique(top10$cluster), function(i) {
+  curr_terms <- dplyr::filter(top10, cluster == i) %>% 
+    dplyr::select(avg_log2FC, gene) %>%
+    as.data.frame()
+  
+  # Make the output into a string that can be fed into a LLM
+  curr_terms <- format(curr_terms, row.names = FALSE)
+  curr_terms <- paste(curr_terms, collapse = "\n")
+  
+  # Build the prompt. Feel free to adjust the wording as needed.
+  prompt <- paste(
+    "Given the following top 10 differentially expressed genes for a given cluster and their average log2 fold change in comparison to their expression in not that cluster, please provide your best guess as to what the cell type is. Don't provide details. Just respond with the name. Nothing else. If you can be more specific (eg. CD4 T cells as opposed to T cells) then please do. The data are as follows:",
+    curr_terms
+  )
+  
+  result <- Chatbot("claude", shQuote(prompt))
+  return(result)
+  }) %>% unlist()
+
+  return(llm_annotations)
+}
+
+llm_annotations <- AnnotationWrapper()
+```
+
+We will leverage the fact that the clustering I do here lines up to the clustering and annotations in the guided clustering tutorial, perhaps because the PBMC 3k dataset is sufficiently simple. 
+
+Anyway below are the annotations from the tutorial:
+
+```{r}
+reference <- data.frame(
+  old_cluster_id = c(0, 1, 2, 3, 4, 5, 6, 7, 8),
+  markers = I(list( c("IL7R","CCR7"),
+                    c("CD14","LYZ"),
+                    c("IL7R","S100A4"),
+                    c("MS4A1"),
+                    c("CD8A"),
+                    c("FCGR3A","MS4A7"),
+                    c("GNLY","NKG7"),
+                    c("FCER1A","CST3"),
+                    c("PPBP")
+                 )),
+  cell_type = c("Naive CD4+ T","CD14+ Mono","Memory CD4+ T","B","CD8+ T",
+                "FCGR3A+ Mono","NK","DC","Platelet")
+)
+
+reference$llm_cell_type <- llm_annotations
+reference
+```
+
+And you can see that the LLM annotations line up with the ones from the tutorial, showing that the LLM-based annotation of the PBMC 3k dataset does in fact work.
+
+I've confirmed in a [previous markdown](https://tjburns08.github.io/annotate_pbmc_3k.html) that the clustering scheme remains sufficiently stable that the cell types in the guided clustering tutorial remain essentially the same despite not having the exact random starting point from the tutorial.
+
+But LLMs can return slightly different answers each time. So it's important to look at the stability of the annotations. Let's run it a bunch of times and see if we can find variation.
+
+```{r}
+annotation_compare <- lapply(1:3, function(i) {
+  result <- AnnotationWrapper()
+  return(result)
+}) %>% do.call(cbind, .) %>% as_tibble()
+```
+
+And now we can visualize and compare.
+
+```{r}
+annotation_compare
+```
+
+In some runs of this markdown, the LLM produced the same results for each of the three annotation runs above. In some runs of the markdown, there were subtle differences, but no blatent inaccurracies. I would suggest that the LLM based annotation should be run multiple times, with the human being the final arbiter as to what the subset is.
+
+Now let's visualize our annotations on a UMAP. First, we will convert our annotations to element metadata in the Seurat object.
+
+```{r}
+# Make sure to convert the cluster numbers to character if necessary:
+pbmc@meta.data$llm_annotation <- reference$llm_cell_type[pbmc@meta.data$seurat_clusters] 
+```
+
+And now we do our plots. First by cluster number.
+
+```{r}
+DimPlot(pbmc, group.by = "seurat_clusters")
+```
+
+Let's look at Seurat's built in annotations now:
+
+```{r}
+DimPlot(pbmc, group.by = "seurat_annotations")
+```
+
+And we compare that to the LLM annotations:
+
+```{r}
+DimPlot(pbmc, group.by = "llm_annotation")
+```
+
+We note that from a communication standpoint, it would be nice if the colors of the LLM annotation plot lined up with those of the Seurat annotation. So we will do that now.
+
+First, we pull out the hex codes for the colors that are associated with the Seurat annotations.
+
+```{r}
+p <- DimPlot(pbmc, group.by = "seurat_annotations")
+p_build <- ggplot_build(p)
+
+ # This prints out details including scale information:
+print(p_build$plot$scales$scales[[1]]$palette.cache)
+```
+
+Then we create a custom color palette. This was done by eyeballing the Seurat annotation plot, and matching the hex codes of the color palette, which R conveniently colors for you.
+
+```{r}
+# Define a custom color palette for the unique cell types
+custom_colors <- c(
+  "CD4 T cells"    = "#F8766D",  
+  "Monocytes"      = "#93AA00",  
+  "CD4+ T cells"   = "#F8766D",  
+  "B cells"        = "#00BA38",  
+  "CD8+ T cells"   = "#00C19F",  
+  "NK cells"       = "#619CFF",  
+  "Dendritic cells"= "#DB72FB",  
+  "Platelets"      = "#FF61C3"
+)
+
+```
+
+And now we make the plot of the LLM annotations that are colored by the custom color palette that we made.
+
+```{r}
+DimPlot(pbmc, group.by = "llm_annotation", cols = custom_colors)
+```
+
+## Discussion
+
+The proof of concept experiment here suggests that at least for the PBMC 3k dataset, Claude 3.5 Sonnet is sufficient to annotate clusters, so far as it has the uniquely expressed genes that mark a given cluster and their average log2 fold change. The clusters are stable through multiple runs. 
+
+The PBMC 3k dataset is relatively simple, healthy PBMCs. It might be that more complex datasets, where there is less "training data" for the LLMs (eg. cancer) could prove challenging for this type of annotation. This has yet to be seen. Nonetheless, having an LLM give you a "first guess" as to what a subset might be is a useful start.
+
+If imperfections are found when this workflow is battle tested in more complex datasets, we note that the user can adjust the prompt to provide additional prior info (eg. what type of dataset is it, corresponding to what patients, and what cell types do you know are in there). In other words, there might be a prompt engineering exercise that must be done with more complex "real world" data.
+
+Furthermore, if you do set up the OpenRouter API and use the code above, you will be able to test multiple models. At the time of writing, Deepseek R1, a reasoning model, is also available to try. Later models available could very well be much better. This workflow is robust to new developments, such that the user can try new chatbots that are available through the API as they come. What does not work now could very well work in a few months or years.
+
+For the reader, I would like you to try this on your data. The above example is PBMCs, and as far as single-cell RNA sequencing data goes, this is a relatively simple dataset. If we move into datasets with developmental trajectories, or cancer data, and so forth, it is likely that the LLMs will trip up. In which case we might have to experiment with some additional prompt engineering or more fine-tuned models. Either way, I would like to know specifically where the LLM makes mistakes, so we have an idea of where to put in work.
+
+Zooming out, the use of LLMs in workflows directly in R is, at the time of writing, relatively unexplored. But I see a future where packages will show up that have LLM-leveraged biological interpretation as an option directly within R and python packages. So the workflow I present here could very well be a harbinger of things to come (this sentence was written on February 7, 2025).
